@@ -175,8 +175,10 @@ impl ServiceBuilder {
                 let mut builder = if <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE <= trouble_host::attribute::MAX_SMALL_DATA_SIZE {
                     service.add_characteristic_small(#uuid, [#(#properties),*], #default_value)
                 } else {
-                    static #name_screaming: static_cell::StaticCell<[u8; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE]> = static_cell::StaticCell::new();
-                    let store = #name_screaming.init([0; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE]);
+                    // SAFETY: one buffer per characteristic, only aliased if a server is built
+                    // twice concurrently. Unlike a one-shot StaticCell this allows rebuilding.
+                    static mut #name_screaming: [u8; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE] = [0; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE];
+                    let store = unsafe { &mut *core::ptr::addr_of_mut!(#name_screaming) };
                     service
                         .add_characteristic(#uuid, [#(#properties),*], #default_value, store)
                 }
@@ -368,8 +370,9 @@ impl ServiceBuilder {
                                         #default_value,
                                     )
                                 } else {
-                                    static #name_screaming: static_cell::StaticCell<[u8; #capacity_screaming]> = static_cell::StaticCell::new();
-                                    let store = #name_screaming.init([0; #capacity]);
+                                    // SAFETY: see construct_characteristic_static.
+                                    static mut #name_screaming: [u8; #capacity_screaming] = [0; #capacity];
+                                    let store = unsafe { &mut *core::ptr::addr_of_mut!(#name_screaming) };
                                     builder.add_descriptor(
                                         #uuid,
                                         #permissions,
