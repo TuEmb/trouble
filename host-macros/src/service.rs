@@ -130,10 +130,23 @@ impl ServiceBuilder {
                 #visibility const ATTRIBUTE_COUNT: usize = #attribute_count;
                 #visibility const CCCD_COUNT: usize = #cccd_count;
 
+                // The value buffers are shared `static mut`s; this flag allows only one live
+                // instance at a time (reset on drop), turning aliasing into a panic. It shares
+                // the buffers' single-threaded assumption, so no atomics are needed.
+                fn __set_built(set: bool) -> bool {
+                    static mut BUILT: bool = false;
+                    unsafe {
+                        let was = core::ptr::read(core::ptr::addr_of!(BUILT));
+                        core::ptr::write(core::ptr::addr_of_mut!(BUILT), set);
+                        was
+                    }
+                }
+
                 #visibility fn new<M, const MAX_ATTRIBUTES: usize>(table: &mut trouble_host::attribute::AttributeTable<'_, M, MAX_ATTRIBUTES>) -> Self
                 where
                     M: trouble_host::__export::embassy_sync::blocking_mutex::raw::RawMutex,
                 {
+                    assert!(!Self::__set_built(true), "gatt service built twice; drop the old instance first");
                     let mut service = table.add_service(trouble_host::attribute::Service::new(#uuid));
                     #code_build_chars
 
@@ -148,6 +161,12 @@ impl ServiceBuilder {
                 }
 
                 #code_impl
+            }
+
+            impl Drop for #struct_name {
+                fn drop(&mut self) {
+                    Self::__set_built(false);
+                }
             }
         }
     }
