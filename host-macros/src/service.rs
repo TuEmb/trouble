@@ -75,6 +75,9 @@ pub(crate) struct ServiceBuilder {
     code_build_chars: TokenStream2,
     code_struct_init: TokenStream2,
     code_fields: TokenStream2,
+    // Fields and initializers for the caller-owned `<Service>Storage` struct.
+    code_storage_fields: TokenStream2,
+    code_storage_init: TokenStream2,
 }
 
 impl ServiceBuilder {
@@ -88,6 +91,8 @@ impl ServiceBuilder {
             code_impl: TokenStream2::new(),
             code_fields: TokenStream2::new(),
             code_build_chars: TokenStream2::new(),
+            code_storage_fields: TokenStream2::new(),
+            code_storage_init: TokenStream2::new(),
         }
     }
     /// Increment the number of access arguments required for this characteristic
@@ -119,10 +124,26 @@ impl ServiceBuilder {
         let uuid = self.args.uuid;
         let attribute_count = self.attribute_count;
         let cccd_count = self.cccd_count;
+        let storage_name = format_ident!("{}Storage", struct_name);
+        let storage_fields = self.code_storage_fields;
+        let storage_init = self.code_storage_init;
         quote! {
             #visibility struct #struct_name {
                 #fields
                 handle: u16,
+            }
+
+            /// Caller-owned storage for this service's large characteristic/descriptor values.
+            #visibility struct #storage_name {
+                #storage_fields
+            }
+
+            #[allow(unused)]
+            impl #storage_name {
+                /// All-zero storage; pass `&mut` into the service's `new`.
+                #visibility const fn new() -> Self {
+                    Self { #storage_init }
+                }
             }
 
             #[allow(unused)]
@@ -130,7 +151,7 @@ impl ServiceBuilder {
                 #visibility const ATTRIBUTE_COUNT: usize = #attribute_count;
                 #visibility const CCCD_COUNT: usize = #cccd_count;
 
-                #visibility fn new<M, const MAX_ATTRIBUTES: usize>(table: &mut trouble_host::attribute::AttributeTable<'_, M, MAX_ATTRIBUTES>) -> Self
+                #visibility fn new<'d, M, const MAX_ATTRIBUTES: usize>(table: &mut trouble_host::attribute::AttributeTable<'d, M, MAX_ATTRIBUTES>, storage: &'d mut #storage_name) -> Self
                 where
                     M: trouble_host::__export::embassy_sync::blocking_mutex::raw::RawMutex,
                 {
@@ -152,10 +173,18 @@ impl ServiceBuilder {
         }
     }
 
+    /// Append `name: [u8; size]` to the generated `<Service>Storage` struct and its
+    /// zero-initializer. `size` is `0` for values that fit inline (no storage needed).
+    fn push_storage_field(&mut self, name: &syn::Ident, size: TokenStream2, cfg: Option<&syn::Attribute>, span: proc_macro2::Span) {
+        let c = cfg.into_iter();
+        self.code_storage_fields.extend(quote_spanned!(span=> #(#c)* #name: [u8; #size],));
+        let c = cfg.into_iter();
+        self.code_storage_init.extend(quote_spanned!(span=> #(#c)* #name: [0u8; #size],));
+    }
+
     /// Construct instructions for adding a characteristic to the service, with static storage.
     fn construct_characteristic_static(&mut self, characteristic: Characteristic) {
         let (code_descriptors, named_descriptors) = self.build_descriptors(&characteristic);
-        let name_screaming = format_ident!("{}_STORE", characteristic.name.as_str().to_case(Case::Constant));
         let char_name = format_ident!("{}", characteristic.name);
         let ty = characteristic.ty;
         let properties = &characteristic.args.properties;
@@ -167,6 +196,13 @@ impl ServiceBuilder {
             None => quote_spanned!(characteristic.span => <#ty>::default()), // or default otherwise
         };
 
+        // Buffer sized to the value, or 0 bytes when it fits inline in the table.
+        let store_size = quote_spanned!(characteristic.span=> {
+            let max = <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE;
+            if max <= trouble_host::attribute::MAX_SMALL_DATA_SIZE { 0 } else { max }
+        });
+        self.push_storage_field(&char_name, store_size, characteristic.args.cfg.as_ref(), characteristic.span);
+
         let cfg_attr = characteristic.args.cfg.as_ref().into_iter();
         self.code_build_chars.extend(quote_spanned! {characteristic.span=>
             #(#cfg_attr)*
@@ -175,8 +211,8 @@ impl ServiceBuilder {
                 let mut builder = if <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE <= trouble_host::attribute::MAX_SMALL_DATA_SIZE {
                     service.add_characteristic_small(#uuid, [#(#properties),*], #default_value)
                 } else {
-                    static #name_screaming: static_cell::StaticCell<[u8; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE]> = static_cell::StaticCell::new();
-                    let store = #name_screaming.init([0; <#ty as trouble_host::types::gatt_traits::AsGatt>::MAX_SIZE]);
+                    // Caller-owned buffer; borrow-checked, so the server can be rebuilt.
+                    let store = &mut storage.#char_name;
                     service
                         .add_characteristic(#uuid, [#(#properties),*], #default_value, store)
                 }
@@ -303,8 +339,6 @@ impl ServiceBuilder {
                 .iter()
                 .enumerate()
                 .map(|(index, args)| {
-                    let name_screaming =
-                        format_ident!("DESC_{index}_{}_STORE", characteristic.name.as_str().to_case(Case::Constant));
                     let identifier = args.name.as_ref().map(|name| format_ident!("{}_{}_descriptor", characteristic.name.as_str(), name.value()));
                     let permissions = set_permissions(&args.permissions);
                     let uuid = &args.uuid;
@@ -357,6 +391,14 @@ impl ServiceBuilder {
                         let capacity_screaming =
                             format_ident!("DESC_{index}_{}_CAPACITY", characteristic.name.as_str().to_case(Case::Constant));
 
+                        // Buffer sized to the descriptor, or 0 bytes when it fits inline.
+                        let desc_field = format_ident!("{}_desc_{index}", characteristic.name.as_str());
+                        let desc_size = quote_spanned!(characteristic.span=> {
+                            let cap = #capacity;
+                            if cap <= trouble_host::attribute::MAX_SMALL_DATA_SIZE { 0 } else { cap }
+                        });
+                        self.push_storage_field(&desc_field, desc_size, characteristic.args.cfg.as_ref(), characteristic.span);
+
                         quote_spanned! {characteristic.span=>
                             #identifier_assignment {
                                 const #capacity_screaming: usize = #capacity;
@@ -368,8 +410,7 @@ impl ServiceBuilder {
                                         #default_value,
                                     )
                                 } else {
-                                    static #name_screaming: static_cell::StaticCell<[u8; #capacity_screaming]> = static_cell::StaticCell::new();
-                                    let store = #name_screaming.init([0; #capacity]);
+                                    let store = &mut storage.#desc_field;
                                     builder.add_descriptor(
                                         #uuid,
                                         #permissions,

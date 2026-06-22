@@ -84,8 +84,10 @@ async fn gatt_client_server() {
             name: &name,
             appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
         });
+        let mut storage = ServerStorage::new();
         let server: Server = Server::new_with_config(
             gap,
+            &mut storage,
         ).unwrap();
 
         // Random starting value to 'prove' the incremented value is correct

@@ -95,10 +95,11 @@ where
     let mut peripheral = stack.peripheral();
 
     info!("Starting advertising and GATT service");
+    let mut storage = ServerStorage::new();
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "TrouBLE",
         appearance: &appearance::human_interface_device::GENERIC_HUMAN_INTERFACE_DEVICE,
-    }))
+    }), &mut storage)
     .unwrap();
 
     let _ = join(ble_task(runner), async {

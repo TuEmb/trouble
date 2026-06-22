@@ -5,7 +5,7 @@
 
 use darling::Error;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned};
 use syn::meta::ParseNestedMeta;
 use syn::spanned::Spanned;
 use syn::{parse_quote, Expr, Result};
@@ -95,18 +95,41 @@ impl ServerBuilder {
         let mut code_server_populate = TokenStream2::new();
         let mut code_attribute_summation = TokenStream2::new();
         let mut code_cccd_summation = TokenStream2::new();
+        // Fields/initializers of the caller-owned `<Server>Storage` struct.
+        let mut code_storage_definition = TokenStream2::new();
+        let mut code_storage_init = TokenStream2::new();
         for service in &self.properties.fields {
             let vis = &service.vis;
             let service_span = service.span();
             let service_name = service.ident.as_ref().expect("All fields should have names");
             let service_type = &service.ty;
 
+            // The service macro generates `<Service>Storage` next to `<Service>`.
+            let service_storage_type: syn::Type = match service_type {
+                syn::Type::Path(p) => {
+                    let mut p = p.clone();
+                    if let Some(last) = p.path.segments.last_mut() {
+                        last.ident = format_ident!("{}Storage", last.ident);
+                        last.arguments = syn::PathArguments::None;
+                    }
+                    syn::Type::Path(p)
+                }
+                other => other.clone(),
+            };
+
             code_service_definition.extend(quote_spanned! {service_span=>
                 #vis #service_name: #service_type,
             });
 
+            code_storage_definition.extend(quote_spanned! {service_span=>
+                #service_name: #service_storage_type,
+            });
+            code_storage_init.extend(quote_spanned! {service_span=>
+                #service_name: #service_storage_type::new(),
+            });
+
             code_service_init.extend(quote_spanned! {service_span=>
-                let #service_name = #service_type::new(&mut table);
+                let #service_name = #service_type::new(&mut table, &mut storage.#service_name);
             });
 
             code_server_populate.extend(quote_spanned! {service_span=>
@@ -134,6 +157,8 @@ impl ServerBuilder {
             parse_quote!(1)
         };
 
+        let storage_name = format_ident!("{}Storage", name);
+
         quote! {
             const _ATTRIBUTE_TABLE_SIZE: usize = const {
                 let size = #attribute_table_size;
@@ -156,12 +181,26 @@ impl ServerBuilder {
                 #code_service_definition
             }
 
+            /// Caller-owned storage for the server's characteristic/descriptor values.
+            #visibility struct #storage_name {
+                #code_storage_definition
+            }
+
+            #[allow(unused)]
+            impl #storage_name {
+                /// All-zero storage; pass `&mut` into the server constructor.
+                #visibility const fn new() -> Self {
+                    Self { #code_storage_init }
+                }
+            }
+
             impl<'values> #name<'values>
             {
                 /// Create a new Gatt Server instance.
                 ///
-                /// Requires you to add your own GAP Service.  Use `new_default(name)` or `new_with_config(name, gap_config)` if you want to add a GAP Service.
-                #visibility fn new(mut table: trouble_host::attribute::AttributeTable<'values, #mutex_type, _ATTRIBUTE_TABLE_SIZE>) -> Self {
+                /// Requires you to add your own GAP Service.  Use `new_default` or `new_with_config` if you want to add a GAP Service.
+                /// `storage` is caller-owned (one buffer per large value); the borrow lasts for the server's lifetime, so it can be rebuilt once dropped.
+                #visibility fn new(mut table: trouble_host::attribute::AttributeTable<'values, #mutex_type, _ATTRIBUTE_TABLE_SIZE>, storage: &'values mut #storage_name) -> Self {
 
                     #code_service_init
 
@@ -175,7 +214,7 @@ impl ServerBuilder {
                 /// This function will add a Generic GAP Service with the given name.
                 /// The maximum length which the name can be is 22 bytes (limited by the size of the advertising packet).
                 /// If a name longer than this is passed, Err() is returned.
-                #visibility fn new_default(name: &'values str) -> Result<Self, &'static str> {
+                #visibility fn new_default(name: &'values str, storage: &'values mut #storage_name) -> Result<Self, &'static str> {
                     let mut table: trouble_host::attribute::AttributeTable<'_, #mutex_type, _ATTRIBUTE_TABLE_SIZE> = trouble_host::attribute::AttributeTable::new();
 
                     trouble_host::gap::GapConfig::default(name).build(&mut table)?;
@@ -193,7 +232,7 @@ impl ServerBuilder {
                 /// This function will add a GAP Service.
                 /// The maximum length which the device name can be is 22 bytes (limited by the size of the advertising packet).
                 /// If a name longer than this is passed, Err() is returned.
-                #visibility fn new_with_config(gap: trouble_host::gap::GapConfig<'values>) -> Result<Self, &'static str> {
+                #visibility fn new_with_config(gap: trouble_host::gap::GapConfig<'values>, storage: &'values mut #storage_name) -> Result<Self, &'static str> {
                     let mut table: trouble_host::attribute::AttributeTable<'_, #mutex_type, _ATTRIBUTE_TABLE_SIZE> = trouble_host::attribute::AttributeTable::new();
 
                     gap.build(&mut table)?;

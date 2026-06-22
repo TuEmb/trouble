@@ -16,8 +16,9 @@ struct CustomService {
 
 #[tokio::test]
 async fn gatt_service_derive() {
+    let mut storage = CustomServiceStorage::new();
     let mut table: AttributeTable<NoopRawMutex, 10> = AttributeTable::new();
-    let service = CustomService::new(&mut table);
+    let service = CustomService::new(&mut table, &mut storage);
 
     // Check all fields of service have been generated and are accessible
     let _handle = service.handle;
